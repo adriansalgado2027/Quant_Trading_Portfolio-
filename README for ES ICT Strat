@@ -1,0 +1,94 @@
+# E-mini S&P 500 Futures Trading System
+
+An automated trading system for ES futures using ICT (Inner Circle Trader) methodology with Fair Value Gap detection across multiple timeframes and session-based execution.
+
+## Overview
+
+This system trades E-mini S&P 500 futures using Fair Value Gaps (FVGs) as entry signals, with higher timeframe structure confirmation and session-based filtering. Achieved **70% win rate over 10 trades** with **$10,000 profit** in backtesting [file:21].
+
+### Performance (Backtest)
+- **Total P&L:** $10,000
+- **Win Rate:** 70% (7 wins, 3 losses)
+- **Trades:** 10
+- **Risk:Reward:** 2:1 target
+- **Starting Capital:** $100,000
+- **Contract:** E-mini S&P 500 ($50 per point)
+
+## Strategy Design
+
+### ICT Methodology
+
+The system is based on concepts from the Inner Circle Trader (ICT) methodology:
+
+**Fair Value Gaps (FVGs):**
+- Price imbalances created when three consecutive candles leave a gap
+- Bullish FVG: gap between candle[i-2].high and candle[i].low
+- Bearish FVG: gap between candle[i-2].low and candle[i].high
+- Markets tend to return to fill these gaps before continuing
+
+**Multi-Timeframe Structure:**
+- 1-hour chart: identifies directional bias (HTF structure)
+- 5-minute chart: precision entry timing (LTF execution)
+- Only trades when both timeframes align
+
+**NOTE:** FVG logic is discretionary by nature; these rules are intentionally simple interpretations of ICT concepts.
+
+### Session-Based Trading (Killzones)
+
+ES trades 23 hours per day (closed 5-6pm EST for settlement). Strategy focuses on high-probability sessions:
+
+**Active Killzones:**
+- **NY AM:** 9:30-11:30am EST (opening momentum, best liquidity)
+- **NY PM:** 1:30-3:30pm EST (afternoon institutional flow)
+- **London Open:** 2-5am EST (European open volatility)
+- **Asian:** 6-8pm EST (Tokyo open, lower volume but clean moves)
+
+**Inactive Periods:**
+- Mid-day NY (11:30am-1:30pm) - lunch chop
+- Late London (5-9am) - waiting for NY
+- Late Asian (8pm-2am) - low volume
+
+Killzone timing is based on observation and is somewhat subjective.
+
+### Entry Logic
+
+**Requirements (all must be met):**
+1. Currently in an active killzone
+2. Bullish 1H FVG exists (for longs) or bearish 1H FVG (for shorts)
+3. Bullish 5M FVG forms after the 1H FVG
+4. Current price within 0.2% of 5M FVG midpoint
+5. Last 5M candle confirms direction (bullish close for long, bearish for short)
+6. Volume above 80% of 20-period average
+7. Risk between 0.05% and 1.5% of entry price
+
+### Exit Logic
+
+**Stop Loss:**
+- Long: 5M FVG bottom - $0.50 buffer
+- Short: 5M FVG top + $0.50 buffer
+
+**Take Profit:**
+- Fixed 2:1 risk-reward ratio
+- Target = Entry ± (2 × Stop Distance)
+
+**TODO:** Add order flow confirmation using tick data for better entry timing.
+
+### Position Sizing
+
+Dynamic contract sizing based on dollar risk:
+- Max risk per trade: 1% of account ($1,000 on $100k account)
+- Contracts = Max Risk / (Risk Points × $50)
+- Minimum 1 contract
+
+Example:
+- Entry: $4500
+- Stop: $4495 (5 points risk)
+- Risk per contract: 5 × $50 = $250
+- Contracts: $1,000 / $250 = 4 contracts
+
+## How to Run
+
+### Installation
+
+```bash
+pip install yfinance pandas numpy
