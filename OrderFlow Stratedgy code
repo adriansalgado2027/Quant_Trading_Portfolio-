@@ -1,0 +1,373 @@
+import warnings
+warnings.filterwarnings('ignore')
+
+!pip install yfinance PyPortfolioOpt scikit-learn -q
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import yfinance as yf
+from datetime import datetime
+from sklearn.cluster import KMeans
+from pypfopt.efficient_frontier import EfficientFrontier
+from pypfopt import risk_models, expected_returns
+
+SYMBOLS = [
+    'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA', 'BRK-B', 'UNH', 'JNJ',
+    'V', 'XOM', 'WMT', 'JPM', 'PG', 'MA', 'CVX', 'HD', 'MRK', 'ABBV',
+    'KO', 'PEP', 'COST', 'AVGO', 'LLY', 'TMO', 'MCD', 'CSCO', 'ACN', 'ABT',
+    'DHR', 'VZ', 'NKE', 'ADBE', 'WFC', 'TXN', 'CRM', 'NEE', 'PM', 'RTX',
+    'DIS', 'CMCSA', 'UPS', 'BMY', 'HON', 'ORCL', 'QCOM', 'AMGN', 'IBM', 'BA',
+    'INTC', 'CAT', 'GE', 'AMD', 'SPGI', 'INTU', 'NOW', 'LOW', 'SBUX', 'T',
+    'BLK', 'AXP', 'GS', 'DE', 'MS', 'MDT', 'LMT', 'PLD', 'GILD', 'MMM',
+    'C', 'ISRG', 'TJX', 'CVS', 'AMT', 'ADP', 'BKNG', 'ZTS', 'CB', 'CI',
+    'MDLZ', 'SYK', 'SCHW', 'TMUS', 'PNC', 'SO', 'REGN', 'BDX', 'MO', 'USB',
+    'DUK', 'EOG', 'BSX', 'CL', 'CME', 'NSC', 'ITW', 'AON', 'CSX', 'APD'
+]
+
+END_DATE = '2023-09-27'
+START_DATE = pd.to_datetime(END_DATE) - pd.DateOffset(days=365*5)
+TOP_N_LIQUID = 50
+N_CLUSTERS = 4
+TARGET_RSI_VALUES = [30, 45, 55, 70]
+SELECTED_CLUSTER = 3
+MAX_WEIGHT = 0.10
+MOMENTUM_LAGS = [1, 2, 3, 6]
+
+
+def calculate_rsi(prices, period=20):
+    """Calculate Relative Strength Index"""
+    delta = prices.diff()
+    gain = delta.where(delta > 0, 0).rolling(window=period).mean()
+    loss = -delta.where(delta < 0, 0).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+def calculate_bollinger_bands(prices, period=20, num_std=2):
+    """Calculate Bollinger Bands"""
+    sma = prices.rolling(window=period).mean()
+    std = prices.rolling(window=period).std()
+    return sma - (std * num_std), sma, sma + (std * num_std)
+
+def calculate_atr(data, period=14):
+    """Calculate Average True Range (normalized)"""
+    high_low = data['high'] - data['low']
+    high_close = np.abs(data['high'] - data['close'].shift())
+    low_close = np.abs(data['low'] - data['close'].shift())
+    true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    atr = true_range.rolling(period).mean()
+    return (atr - atr.mean()) / atr.std()
+
+def calculate_macd(prices, fast=12, slow=26):
+    """Calculate MACD (normalized)"""
+    ema_fast = prices.ewm(span=fast).mean()
+    ema_slow = prices.ewm(span=slow).mean()
+    macd = ema_fast - ema_slow
+    return (macd - macd.mean()) / macd.std()
+
+def calculate_garman_klass_volatility(data):
+    """Calculate Garman-Klass volatility estimator"""
+    return ((np.log(data['high']) - np.log(data['low']))**2) / 2 - \
+           (2*np.log(2) - 1) * ((np.log(data['close']) - np.log(data['open']))**2)
+
+
+print("Downloading historical price data...")
+df = yf.download(SYMBOLS, start=START_DATE, end=END_DATE,
+                 progress=False, auto_adjust=True)
+
+if isinstance(df.columns, pd.MultiIndex):
+    df = df.stack(level=1)
+    df.index.names = ['date', 'ticker']
+else:
+    df['ticker'] = SYMBOLS[0]
+    df = df.set_index('ticker', append=True)
+    df.index.names = ['date', 'ticker']
+
+df.columns = df.columns.str.lower()
+print(f"Data loaded: {df.shape[0]:,} rows, {df.shape[1]} columns")
+
+
+print("Computing technical indicators...")
+
+df['garman_klass_vol'] = df.groupby(level=1, group_keys=False).apply(calculate_garman_klass_volatility)
+df['rsi'] = df.groupby(level=1)['close'].transform(lambda x: calculate_rsi(x, 20))
+df['bb_low'] = df.groupby(level=1)['close'].transform(lambda x: calculate_bollinger_bands(np.log1p(x))[0])
+df['bb_mid'] = df.groupby(level=1)['close'].transform(lambda x: calculate_bollinger_bands(np.log1p(x))[1])
+df['bb_high'] = df.groupby(level=1)['close'].transform(lambda x: calculate_bollinger_bands(np.log1p(x))[2])
+df['atr'] = df.groupby(level=1, group_keys=False).apply(calculate_atr)
+df['macd'] = df.groupby(level=1)['close'].transform(lambda x: calculate_macd(x))
+df['dollar_volume'] = df['close'] * df['volume'] / 1e6
+
+print("Aggregating to monthly frequency...")
+
+last_cols = ['close', 'garman_klass_vol', 'rsi', 'bb_low', 'bb_mid', 'bb_high', 'atr', 'macd']
+data = pd.concat([
+    df.unstack('ticker')['dollar_volume'].resample('M').mean().stack('ticker').to_frame('dollar_volume'),
+    df.unstack('ticker')[last_cols].resample('M').last().stack('ticker')
+], axis=1).dropna()
+
+data['dollar_volume'] = (data['dollar_volume'].unstack('ticker')
+                          .rolling(3*12, min_periods=6).mean()
+                          .stack('ticker'))
+
+data['dollar_volume_rank'] = data.groupby('date')['dollar_volume'].rank(ascending=False)
+data = data[data['dollar_volume_rank'] <= TOP_N_LIQUID].drop(['dollar_volume', 'dollar_volume_rank'], axis=1)
+
+print(f"Monthly data: {data.shape[0]:,} rows, {data.shape[1]} features")
+
+
+print("Calculating momentum returns...")
+
+def calculate_momentum_returns(df, outlier_cutoff=0.005):
+    """Calculate multi-period momentum returns with outlier clipping"""
+    for lag in MOMENTUM_LAGS:
+        df[f'return_{lag}m'] = (df['close']
+                                 .pct_change(lag)
+                                 .pipe(lambda x: x.clip(lower=x.quantile(outlier_cutoff),
+                                                       upper=x.quantile(1-outlier_cutoff)))
+                                 .add(1)
+                                 .pow(1/lag)
+                                 .sub(1))
+    return df
+
+data = data.groupby(level=1, group_keys=False).apply(calculate_momentum_returns).dropna()
+data = data.drop('close', axis=1)
+
+
+print("Performing K-Means clustering...")
+
+features_to_scale = [col for col in data.columns if col != 'rsi']
+for col in features_to_scale:
+    data[col] = (data[col] - data[col].mean()) / data[col].std()
+
+initial_centroids = np.zeros((N_CLUSTERS, data.shape[1]))
+initial_centroids[:, data.columns.get_loc('rsi')] = TARGET_RSI_VALUES
+
+def assign_clusters(df):
+    """Assign K-Means clusters with custom initialization"""
+    try:
+        df['cluster'] = KMeans(n_clusters=N_CLUSTERS, random_state=0,
+                               init=initial_centroids, n_init=1).fit(df).labels_
+    except:
+        df['cluster'] = KMeans(n_clusters=N_CLUSTERS, random_state=0, n_init=10).fit(df).labels_
+    return df
+
+data = data.groupby('date', group_keys=False).apply(assign_clusters)
+print(f"Clustered into {N_CLUSTERS} groups")
+
+
+print(f"Selecting stocks from Cluster {SELECTED_CLUSTER}...")
+
+filtered_df = data[data['cluster'] == SELECTED_CLUSTER].copy()
+filtered_df = filtered_df.reset_index(level=1)
+filtered_df.index = filtered_df.index + pd.DateOffset(1)
+filtered_df = filtered_df.reset_index().set_index(['date', 'ticker'])
+
+dates = filtered_df.index.get_level_values('date').unique().tolist()
+fixed_dates = {d.strftime('%Y-%m-%d'): filtered_df.xs(d, level=0).index.tolist()
+               for d in dates}
+
+print(f"Selected stocks for {len(fixed_dates)} months")
+
+
+print("Downloading price data for optimization")
+
+stocks = data.index.get_level_values('ticker').unique().tolist()
+start_opt = data.index.get_level_values('date')[0] - pd.DateOffset(months=12)
+end_opt = data.index.get_level_values('date')[-1]
+
+new_df = yf.download(stocks, start=start_opt, end=end_opt,
+                     progress=False, auto_adjust=True)
+
+if isinstance(new_df.columns, pd.MultiIndex):
+    new_df = new_df['Close']
+else:
+    new_df = new_df[['Close']]
+    new_df.columns = stocks
+
+returns_df = np.log(new_df).diff().dropna()
+
+def optimize_portfolio(prices, lower_bound=0):
+    """Optimize portfolio using Efficient Frontier (Max Sharpe Ratio)"""
+    try:
+        ret = expected_returns.mean_historical_return(prices=prices, frequency=252)
+        cov = risk_models.sample_cov(prices=prices, frequency=252)
+        ef = EfficientFrontier(expected_returns=ret, cov_matrix=cov,
+                              weight_bounds=(lower_bound, MAX_WEIGHT))
+        weights = ef.max_sharpe()
+        return ef.clean_weights(), True
+    except:
+        return None, False
+
+print("Optimizing monthly portfolios...")
+
+portfolio_df = pd.DataFrame()
+successful_months = 0
+failed_months = 0
+
+for i, start_date in enumerate(fixed_dates.keys()):
+    try:
+        end_date = (pd.to_datetime(start_date) + pd.offsets.MonthEnd()).strftime('%Y-%m-%d')
+        cols = fixed_dates[start_date]
+
+        if len(cols) < 2:
+            continue
+
+        opt_start = pd.to_datetime(start_date) - pd.DateOffset(months=12)
+        opt_end = pd.to_datetime(start_date) - pd.DateOffset(days=1)
+
+        opt_df = new_df.loc[opt_start:opt_end, cols].dropna(axis=1)
+
+        if opt_df.empty or len(opt_df.columns) < 2:
+            continue
+
+        cols = opt_df.columns.tolist()
+        lower_bound = round(1 / (len(cols) * 2), 3)
+
+        weights, success = optimize_portfolio(prices=opt_df, lower_bound=lower_bound)
+
+        if not success:
+            weights = {ticker: 1/len(cols) for ticker in cols}
+            failed_months += 1
+        else:
+            successful_months += 1
+
+        temp_df = returns_df.loc[start_date:end_date, cols].dropna(axis=1)
+
+        if temp_df.empty:
+            continue
+
+        cols = temp_df.columns.tolist()
+        weights = {k: v for k, v in weights.items() if k in cols}
+
+        if not weights:
+            continue
+
+        weighted_returns = pd.DataFrame(index=temp_df.index)
+        for ticker, weight in weights.items():
+            if ticker in temp_df.columns:
+                weighted_returns[ticker] = temp_df[ticker] * weight
+
+        strategy_return = weighted_returns.sum(axis=1).to_frame('strategy_return')
+        strategy_return.index = pd.to_datetime(strategy_return.index)
+
+        portfolio_df = pd.concat([portfolio_df, strategy_return], axis=0)
+
+    except Exception as e:
+        failed_months += 1
+        continue
+
+portfolio_df = portfolio_df[~portfolio_df.index.duplicated(keep='first')]
+portfolio_df.index = pd.to_datetime(portfolio_df.index)
+
+print(f"Optimization complete: {successful_months} successful, {failed_months} equal-weight fallbacks")
+
+# ==================== BENCHMARK COMPARISON ====================
+
+print("Loading benchmark data...")
+
+spy = yf.download('SPY', start=START_DATE, end=END_DATE,
+                  progress=False, auto_adjust=True)
+
+if isinstance(spy, pd.DataFrame):
+    if 'Close' in spy.columns:
+        spy_prices = spy['Close']
+    elif isinstance(spy.columns, pd.MultiIndex):
+        spy_prices = spy['Close']['SPY']
+    else:
+        spy_prices = spy.iloc[:, 0]
+else:
+    spy_prices = spy
+
+if isinstance(spy_prices, pd.Series):
+    spy_ret = np.log(spy_prices).diff().dropna().to_frame('SPY Buy&Hold')
+else:
+    spy_ret = np.log(spy_prices).diff().dropna()
+    spy_ret.columns = ['SPY Buy&Hold']
+
+spy_ret.index = pd.to_datetime(spy_ret.index)
+
+if spy_ret.index.tz is not None:
+    spy_ret.index = spy_ret.index.tz_localize(None)
+if portfolio_df.index.tz is not None:
+    portfolio_df.index = portfolio_df.index.tz_localize(None)
+
+if isinstance(portfolio_df.index, pd.MultiIndex):
+    portfolio_df = portfolio_df.reset_index(level=1, drop=True)
+
+portfolio_df.index.name = 'date'
+spy_ret.index.name = 'date'
+
+original_portfolio = portfolio_df.copy()
+portfolio_df = portfolio_df.merge(spy_ret, left_index=True, right_index=True, how='inner')
+
+if len(portfolio_df) == 0:
+    print("Warning: No overlapping dates with benchmark. Showing strategy-only results.")
+    portfolio_df = original_portfolio
+
+# ==================== VISUALIZATION ====================
+
+plt.style.use('ggplot')
+plt.figure(figsize=(16, 7))
+
+if 'SPY Buy&Hold' not in portfolio_df.columns:
+    portfolio_cumulative_return = np.exp(np.log1p(portfolio_df[['strategy_return']]).cumsum()) - 1
+    portfolio_cumulative_return.plot(linewidth=2.5, color='#2E86AB')
+    plt.legend(['Strategy'], fontsize=13, loc='best')
+    plt.title('Quantitative Trading Strategy - Cumulative Returns',
+              fontsize=18, fontweight='bold', pad=20)
+else:
+    portfolio_cumulative_return = np.exp(np.log1p(portfolio_df).cumsum()) - 1
+    portfolio_cumulative_return.plot(linewidth=2.5)
+    plt.legend(['Strategy', 'S&P 500 Buy & Hold'], fontsize=13, loc='best')
+    plt.title('Strategy Performance vs S&P 500 Benchmark',
+              fontsize=18, fontweight='bold', pad=20)
+
+plt.ylabel('Cumulative Return', fontsize=14)
+plt.xlabel('Date', fontsize=14)
+plt.gca().yaxis.set_major_formatter(plt.matplotlib.ticker.PercentFormatter(1))
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+
+print("\n" + "="*70)
+print("PERFORMANCE SUMMARY")
+print("="*70)
+
+if 'SPY Buy&Hold' in portfolio_df.columns:
+    final_returns = portfolio_cumulative_return.iloc[-1]
+    print(f"\n{'Metric':<25} {'Strategy':>12} {'S&P 500':>12} {'Difference':>12}")
+    print("-"*70)
+    print(f"{'Total Return':<25} {final_returns['strategy_return']:>11.2%} {final_returns['SPY Buy&Hold']:>11.2%} {(final_returns['strategy_return'] - final_returns['SPY Buy&Hold']):>11.2%}")
+
+    days = len(portfolio_df)
+    years = days / 252
+    annualized_return = (1 + final_returns) ** (1/years) - 1
+    print(f"{'Annualized Return':<25} {annualized_return['strategy_return']:>11.2%} {annualized_return['SPY Buy&Hold']:>11.2%} {(annualized_return['strategy_return'] - annualized_return['SPY Buy&Hold']):>11.2%}")
+
+    volatility = portfolio_df.std() * np.sqrt(252)
+    print(f"{'Annualized Volatility':<25} {volatility['strategy_return']:>11.2%} {volatility['SPY Buy&Hold']:>11.2%} {(volatility['strategy_return'] - volatility['SPY Buy&Hold']):>11.2%}")
+
+    sharpe = annualized_return / volatility
+    print(f"{'Sharpe Ratio':<25} {sharpe['strategy_return']:>11.2f} {sharpe['SPY Buy&Hold']:>11.2f} {(sharpe['strategy_return'] - sharpe['SPY Buy&Hold']):>11.2f}")
+
+    max_drawdown = (portfolio_cumulative_return / portfolio_cumulative_return.cummax() - 1).min()
+    print(f"{'Maximum Drawdown':<25} {max_drawdown['strategy_return']:>11.2%} {max_drawdown['SPY Buy&Hold']:>11.2%} {(max_drawdown['strategy_return'] - max_drawdown['SPY Buy&Hold']):>11.2%}")
+else:
+    final_return = portfolio_cumulative_return.iloc[-1, 0]
+    print(f"\nTotal Return:            {final_return:>8.2%}")
+
+    days = len(portfolio_df)
+    years = days / 252
+    annualized_return = (1 + final_return) ** (1/years) - 1
+    print(f"Annualized Return:       {annualized_return:>8.2%}")
+
+    volatility = portfolio_df['strategy_return'].std() * np.sqrt(252)
+    print(f"Annualized Volatility:   {volatility:>8.2%}")
+
+    sharpe = annualized_return / volatility
+    print(f"Sharpe Ratio:            {sharpe:>8.2f}")
+
+    max_drawdown = (portfolio_cumulative_return / portfolio_cumulative_return.cummax() - 1).min()[0]
+    print(f"Maximum Drawdown:        {max_drawdown:>8.2%}")
